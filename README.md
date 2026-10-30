@@ -1,3 +1,6 @@
+# This is a Beta intergrations add-on
+While this was designed for my AI Stream Co-Host framework, I tried to make it so this could be added to any AI Stream Co-Host framework. Feedback would be appricated to help improve it and make it better.
+
 # Kick AI Bridge
 
 Framework-agnostic Kick chat bridge. Receive Kick chat messages and hand them
