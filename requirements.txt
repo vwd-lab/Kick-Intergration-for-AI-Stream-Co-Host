@@ -1,0 +1,12 @@
+# Requirements for the Kick share kit.
+python-dotenv>=1.0.0
+requests>=2.31.0
+aiohttp>=3.9
+rich>=13.0.0
+
+# cloudflared is NOT a pip package. Install it separately if you use the
+# included tunnel helper (or point KICK_WEBHOOK_URL at any HTTPS tunnel):
+#   winget install --id Cloudflare.cloudflared
+
+# NOTE: this kit has no voice/audio and does not need FFmpeg.
+# RSA webhook signature verification is pure stdlib (no `cryptography`).

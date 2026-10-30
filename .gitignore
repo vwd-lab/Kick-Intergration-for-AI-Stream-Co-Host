@@ -1,0 +1,6 @@
+.env
+kick_tokens.json
+kick_tokens.json.tmp
+data/kick_tunnel_url.txt
+__pycache__/
+*.pyc

@@ -1,0 +1,72 @@
+================================================================================
+ COMMANDS - Kick integration (standalone share kit)
+================================================================================
+KICK CHAT (viewers)
+--------------------------------------------------------------------------------
+The receiver forwards EVERY message in the channel to your queue. There is no
+mention/keyword gate; that decision belongs to your bot.
+
+  !ask <msg>       Formatted as a question:
+                   [Kick viewer 'kick:name' asks]: <msg>
+                   The prefix itself is stripped. Set KICK_COMMAND_PREFIX (or
+                   command_prefix=...) to change it.
+
+  <anything>       Forwarded as a statement:
+                   [Kick viewer 'kick:name' says]: <anything>
+
+Moderators and the broadcaster are tagged " (mod)"; subscribers " (sub)".
+Emotes are flattened from [emote:ID:NAME] to NAME.
+
+The demo harness handles these itself:
+  !ping            Reply "pong" (if text replies are enabled)
+  !help            Reply with a one-line usage hint
+Everything else that is not an "asks" message is printed but not answered.
+
+--------------------------------------------------------------------------------
+ IMPORTANT: if the bot posts into chat
+--------------------------------------------------------------------------------
+Kick can echo the bot's own messages back through the webhook. Set
+KICK_BOT_ACCOUNT to the bot's username (or add it to KICK_IGNORED_USERS) so the
+receiver drops them instead of creating a reply loop.
+
+--------------------------------------------------------------------------------
+ ADMIN SCRIPTS (run from this folder)
+--------------------------------------------------------------------------------
+  python setup_kick_webhook.py show       Current channel id + subscriptions
+  python setup_kick_webhook.py subscribe  (Re)create chat.message.sent for you
+  python setup_kick_webhook.py prune      Drop subscriptions for other channels
+  python setup_kick_webhook.py delete     Remove every chat.message.sent sub
+
+  python setup_kick_auth.py               One-time OAuth for the bot account
+                                          (browser; approves chat:write)
+
+  python kick_tunnel_host.py              cloudflared quick tunnel; prints the
+                                          public URL and writes it to
+                                          data/kick_tunnel_url.txt
+
+  python demo_main.py                     API demo (receiver + optional sender)
+
+--------------------------------------------------------------------------------
+ HTTP ENDPOINTS (on the receiver, default 127.0.0.1:8770)
+--------------------------------------------------------------------------------
+  POST /kick/events     Kick's webhook target. Verifies the RSA signature,
+                        dedupes by message id, checks the channel slug, and
+                        pushes chat into the queue.
+  GET  /kick/status     JSON counters + tunnel health (same as /health)
+  GET  /health          Alias for /kick/status
+
+  Status fields:
+      channel, port, received, verified, rejected, tunnel_ok,
+      last_event_seconds_ago, public_url, note
+
+  Kick only POSTs while the channel is live and someone is talking, so
+  verified=0 is normal on a quiet channel. tunnel_ok=false means Kick cannot
+  reach the receiver - fix the tunnel/portal URL.
+
+--------------------------------------------------------------------------------
+ OOC / PERSONA / VOICE - NOT part of this kit
+--------------------------------------------------------------------------------
+This kit is transport only: Kick chat in, optional Kick chat out. It does not
+ship a brain, persona, OOC toggle, text-to-speech, or voice-channel support.
+Handle those in your own bot. Kick has no voice channel in this integration.
+================================================================================

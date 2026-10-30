@@ -1,0 +1,16 @@
+{
+  "kick_channel": "yourchannelslug",
+  "kick_client_id": "",
+  "kick_client_secret": "",
+  "kick_access_token": "",
+  "kick_refresh_token": "",
+  "public_url": "https://xxxxxx.cloudflared-url.com/kick/webhook",
+  "webhook_port": 8765,
+  "adapter": "file",
+  "http_callback": "http://localhost:5000/kick",
+  "text_replies": true,
+  "command_prefix": "!ask",
+  "reply_prefix": "Bot:",
+  "max_reply_chars": 500,
+  "log_to_console": true
+}
