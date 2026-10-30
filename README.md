@@ -171,6 +171,3 @@ The one requirement is attribution: the copyright notice and license text must
 be retained in all copies or substantial portions of the software, so the
 original creator (the Radeon AI Co-Host authors) stays credited no matter how
 far downstream the code is shared.
-
-Replace "The Radeon AI Co-Host authors" in LICENSE with your legal name if you
-want the copyright to identify you personally.
