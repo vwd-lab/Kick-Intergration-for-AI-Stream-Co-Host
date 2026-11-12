@@ -60,9 +60,11 @@ The GUI can launch either:
 | Mode | Script | Best for |
 |---|---|---|
 | **production** (default) | `demo_main.py` | Kick signature verification, tunnel health watchdog, token refresh. Recommended for actual streaming. |
-| **simple** | `kick_bridge.py` | Single-file, no signature verification. Good for quick testing / non-Kick-verified webhooks. |
+| **simple** | `kick_bridge.py` | Single file. Checks Kick's signature on every request (same check as production) but has no tunnel watchdog or token refresh. |
 
-Both import only the stdlib plus `requests` (production also needs `aiohttp`).
+Both need the packages in `requirements.txt` (`requests`, `aiohttp`, `rich`): simple mode reuses the production signature checker. Install them with `python -m pip install -r requirements.txt`.
+
+Simple mode listens on `127.0.0.1` only. Reach it through the tunnel; don't port-forward. Requests without a valid Kick signature are rejected with HTTP 401, so you can't test it by POSTing JSON by hand.
 
 ## Setup you'll still need
 
@@ -137,7 +139,7 @@ python demo_main.py
 | File | Purpose |
 |---|---|
 | `demo_main.py` | Production wiring harness (receiver → your `handle_message()` → sender) |
-| `kick_bridge.py` | Simple single-file bridge (no signature verification) |
+| `kick_bridge.py` | Simple single-file bridge (Kick signature verified, localhost only) |
 | `kick_gui.py` | tkinter launcher (stdlib only) |
 | `setup_kick_gui.bat` | Interactive setup: prompts for channel, URL, adapter, then launches `kick_gui.py` |
 | `start_kick_bridge.bat` | Double-click launcher (uses existing `config.json`) |

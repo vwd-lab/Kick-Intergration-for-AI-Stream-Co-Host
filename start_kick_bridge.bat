@@ -11,8 +11,8 @@ REM Prefer a project venv if present, otherwise fall back to PATH python.
 set "PY=python"
 if exist ".venv\Scripts\python.exe" set "PY=.venv\Scripts\python.exe"
 
-REM Ensure the requests package is available (kick_bridge.py imports it).
-REM Install once: %PY% -m pip install requests
+REM kick_bridge.py needs requests, aiohttp and rich (it reuses the production
+REM signature checker). Install once: %PY% -m pip install -r requirements.txt
 
 echo Starting Kick AI Bridge...
 "%PY%" kick_gui.py

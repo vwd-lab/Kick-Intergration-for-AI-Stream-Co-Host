@@ -13,22 +13,40 @@ Three ways to connect a bot:
 No Kick login credentials are stored here permanently. You register a
 Kick developer app, run setup once to get an access token, and the bridge
 uses it to post replies back into chat.
+
+Security: every POST must carry a valid Kick RSA signature, checked with the
+same code the production listener uses (input/kick_webhook.py). The server
+binds to 127.0.0.1 by default; the tunnel (cloudflared/ngrok) connects from
+this machine, so it still works. Binding to localhost alone is NOT enough
+protection, because tunnel traffic also arrives from localhost - that is why
+the signature check is required and cannot be switched off.
 """
 
 import json
 import os
 import threading
 import time
-import uuid
+from collections import OrderedDict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse, parse_qs
 
 import requests
+
+try:
+    # One copy of the crypto code: reuse the production listener's checker.
+    from input.kick_webhook import verify_signature, fetch_public_key
+except ImportError as _e:  # aiohttp / rich not installed
+    raise SystemExit(
+        f"kick_bridge.py could not load the signature checker ({_e}).\n"
+        "Install the kit's requirements first:  python -m pip install -r requirements.txt"
+    )
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(ROOT, "config.json")
 MESSAGES_PATH = os.path.join(ROOT, "messages.json")
 LOG_PATH = os.path.join(ROOT, "bridge.log")
+
+# Kick chat webhooks are a few KB. Anything far bigger is not from Kick.
+MAX_BODY_BYTES = 64 * 1024
 
 
 # ---------------------------------------------------------------------------
@@ -58,6 +76,7 @@ DEFAULT_CONFIG = {
     "kick_refresh_token": "",      # populated after OAuth setup
     "public_url": "",              # https://xxxx.cloudflared_url or ngrok url
     "webhook_port": 8765,          # local port the bridge listens on
+    "bind_host": "127.0.0.1",      # keep local; the tunnel connects from this PC
     "adapter": "file",             # file | http | custom
     "http_callback": "",           # http://localhost:5000/kick (if adapter=http)
     "text_replies": True,          # post bot replies back into Kick chat
@@ -212,46 +231,163 @@ def post_kick_message(channel, access_token, text):
 
 
 # ---------------------------------------------------------------------------
+# Webhook security
+# ---------------------------------------------------------------------------
+
+class SignatureChecker:
+    """Checks Kick's RSA signature on each webhook request.
+
+    Same scheme as KickWebhookListener._verify in input/kick_webhook.py.
+    Kick's public key is fetched live (Kick can rotate it), cached for an
+    hour, and the old key is kept if a refresh fails, so one network blip
+    does not reject every message.
+    """
+
+    KEY_TTL_S = 3600
+    RETRY_S = 60
+
+    def __init__(self, fetch=fetch_public_key, verify=verify_signature):
+        self._fetch = fetch
+        self._verify = verify
+        self._lock = threading.Lock()
+        self._key = None
+        self._key_at = 0.0
+        self._next_try = 0.0
+
+    def _current_key(self):
+        with self._lock:
+            now = time.time()
+            stale = self._key is None or (now - self._key_at) > self.KEY_TTL_S
+            if stale and now >= self._next_try:
+                try:
+                    self._key = self._fetch()
+                    self._key_at = now
+                except Exception as e:
+                    self._next_try = now + self.RETRY_S
+                    note = " (still using the cached key)" if self._key else ""
+                    _log(f"Cannot fetch Kick public key: {e}{note}")
+            return self._key
+
+    def check(self, headers, raw: bytes) -> bool:
+        msg_id = headers.get("Kick-Event-Message-Id", "")
+        ts = headers.get("Kick-Event-Message-Timestamp", "")
+        sig = headers.get("Kick-Event-Signature", "")
+        if not (msg_id and ts and sig):
+            return False
+        key = self._current_key()
+        if not key:
+            return False
+        signed = f"{msg_id}.{ts}.".encode("utf-8") + raw
+        if self._verify(key, signed, sig):
+            return True
+        # Same body-only fallback as the production listener. Tightening it
+        # belongs to the replay-protection fix, not this one.
+        return self._verify(key, raw, sig)
+
+
+class SeenIds:
+    """Remembers recent Kick message ids so a retried delivery is handled once."""
+
+    def __init__(self, max_items=2000):
+        self._max = max_items
+        self._ids = OrderedDict()
+        self._lock = threading.Lock()
+
+    def seen_before(self, msg_id: str) -> bool:
+        if not msg_id:
+            return False
+        with self._lock:
+            if msg_id in self._ids:
+                return True
+            self._ids[msg_id] = time.time()
+            while len(self._ids) > self._max:
+                self._ids.popitem(last=False)
+            return False
+
+
+CHECKER = SignatureChecker()
+SEEN = SeenIds()
+STATS = {"received": 0, "accepted": 0, "rejected": 0}
+_STATS_LOCK = threading.Lock()
+
+
+def _count(key):
+    with _STATS_LOCK:
+        STATS[key] += 1
+        return STATS[key]
+
+
+# ---------------------------------------------------------------------------
 # Webhook server
 # ---------------------------------------------------------------------------
 
 class KickWebhookHandler(BaseHTTPRequestHandler):
-    """Receives Kick chat.message.sent webhooks."""
+    """Receives Kick chat.message.sent webhooks.
+
+    Order matters: size check, then signature, then dedupe, then parsing.
+    Nothing from an unsigned request is ever parsed or queued.
+    """
 
     def log_message(self, format, *args):
         if load_config().get("log_to_console", True):
             _log("%s - %s" % (self.address_string(), format % args))
 
-    def do_POST(self):
-        length = int(self.headers.get("Content-Length", 0))
-        body = self.rfile.read(length)
-        try:
-            payload = json.loads(body)
-        except Exception:
-            self.send_response(400)
-            self.end_headers()
-            self.wfile.write(b"bad json")
-            return
-
-        event_type = payload.get("type") or payload.get("event", {}).get("type")
-        data = payload.get("data", payload)
-
-        if event_type == "chat.message.sent" or "message" in str(data).lower():
-            username = (data.get("sender", {}) or {}).get("username", "viewer")
-            message = data.get("content") or data.get("message") or ""
-            msg_id = data.get("id") or str(uuid.uuid4())
-
-            if message and username:
-                _log(f"Kick <- {username}: {message}")
-                reply = BRIDGE.dispatch(username, message, msg_id)
-                if reply:
-                    _log(f"Kick -> {username}: {reply[:80]}...")
-                    if load_config().get("text_replies"):
-                        _post_reply(reply)
-
-        self.send_response(200)
+    def _reply(self, code, body=b""):
+        self.send_response(code)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        self.wfile.write(b"ok")
+        self.wfile.write(body)
+
+    def do_POST(self):
+        _count("received")
+
+        try:
+            length = int(self.headers.get("Content-Length", ""))
+        except ValueError:
+            return self._reply(411, b"length required")
+        if length < 0 or length > MAX_BODY_BYTES:
+            return self._reply(413, b"too large")
+        raw = self.rfile.read(length)
+
+        if not CHECKER.check(self.headers, raw):
+            n = _count("rejected")
+            if n <= 3 or n % 50 == 0:   # don't let junk traffic flood the log
+                _log(f"Rejected a request without a valid Kick signature (total {n})")
+            return self._reply(401, b"invalid signature")
+
+        msg_id = self.headers.get("Kick-Event-Message-Id", "")
+        if SEEN.seen_before(msg_id):
+            return self._reply(200, b"duplicate")   # 200 so Kick stops retrying
+
+        if self.headers.get("Kick-Event-Type", "") != "chat.message.sent":
+            return self._reply(200, b"ignored")
+
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError):
+            return self._reply(400, b"bad json")
+        if not isinstance(payload, dict):
+            return self._reply(400, b"bad json")
+
+        cfg = load_config()
+        want = (cfg.get("kick_channel") or "").strip().lower()
+        slug = ((payload.get("broadcaster") or {}).get("channel_slug") or "").strip().lower()
+        if want and slug and slug != want:
+            return self._reply(200, b"other channel")
+
+        username = ((payload.get("sender") or {}).get("username") or "").strip()
+        message = (payload.get("content") or "").strip()
+        if message and username:
+            _count("accepted")
+            _log(f"Kick <- {username}: {message}")
+            reply = BRIDGE.dispatch(username, message, msg_id)
+            if reply:
+                _log(f"Kick -> {username}: {reply[:80]}...")
+                if cfg.get("text_replies"):
+                    _post_reply(reply)
+
+        self._reply(200, b"ok")
 
 
 # ---------------------------------------------------------------------------
@@ -272,10 +408,14 @@ class KickBridge:
     def start(self):
         cfg = self.config
         port = int(cfg.get("webhook_port", 8765))
-        self._server = ThreadingHTTPServer(("0.0.0.0", port), KickWebhookHandler)
+        host = (cfg.get("bind_host") or "127.0.0.1").strip()
+        self._server = ThreadingHTTPServer((host, port), KickWebhookHandler)
         t = threading.Thread(target=self._server.serve_forever, daemon=True)
         t.start()
-        _log(f"Bridge listening on port {port}")
+        _log(f"Bridge listening on http://{host}:{port} (Kick signature required)")
+        if host not in ("127.0.0.1", "localhost", "::1"):
+            _log(f"Note: bind_host is {host}, so other machines can reach this port. "
+                 "Signatures are still checked, but 127.0.0.1 is safer.")
         pub = cfg.get("public_url", "(not set)")
         _log(f"Public URL for Kick webhook: {pub}")
         _log(f"Adapter: {self.adapter.name()}")

@@ -42,7 +42,7 @@ if not defined ADAPTER set ADAPTER=file
 echo.
 echo Bridge mode options:
 echo   production = demo_main.py with signature verification + token refresh (recommended)
-echo   simple     = kick_bridge.py single file (testing only)
+echo   simple     = kick_bridge.py single file, signature checked, no token refresh
 set "MODE="
 set /p MODE="Bridge mode [production/simple] (default production): "
 if not defined MODE set MODE=production

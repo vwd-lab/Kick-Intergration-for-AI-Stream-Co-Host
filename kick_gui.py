@@ -131,7 +131,8 @@ class KickBridgeGUI(tk.Tk):
         ttk.Label(
             left,
             text="Give this URL to Kick in your app's webhook settings.\n"
-                 "Use cloudflared / ngrok / port-forward to expose localhost.",
+                 "Use cloudflared or ngrok to reach this PC (no port-forward:\n"
+                 "the bridge only listens on 127.0.0.1).",
             wraplength=300, foreground="#666666",
         ).pack(anchor=tk.W, pady=(4, 0))
 
@@ -167,7 +168,8 @@ class KickBridgeGUI(tk.Tk):
             right,
             text="production = demo_main.py with Kick signature verification,\n"
                  "tunnel health watchdog, and token refresh (recommended)\n"
-                 "simple    = kick_bridge.py, single file, no verification",
+                 "simple    = kick_bridge.py, single file, Kick signature\n"
+                 "            verification, no watchdog or token refresh",
             wraplength=320, foreground="#666666",
         ).pack(anchor=tk.W, pady=(4, 0))
 
