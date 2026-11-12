@@ -1,6 +1,6 @@
 # Changelog — sharing\Kick (MIT)
 
-Canonical working copy at `C:\Users\bbsti\AI Projects\Project AI Logan\sharing\Kick`.
+Canonical working copy at `C:\XXXXX\AI Projects\Project AI Logan\sharing\Kick`.
 
 Framework-agnostic Kick chat bridge. Transport-only: ships no brain, persona,
 TTS, or voice. Receives Kick chat through Kick's official `chat.message.sent`
@@ -22,4 +22,8 @@ This is not a git repository, so versions are tracked here by date instead of co
 
 ## Planned
 
-- (none yet — log changes here as they land)
+-Fixes based on feedback:
+- Fixed Kick "simple" mode security (kick_bridge.py): every POST now requires a valid Kick RSA signature (same check as production listener in input/kick_webhook.py). Server binds to 127.0.0.1 by default instead of 0.0.0.0. Rejects bodies over 64 KB (413) and requests without Content-Length (411). Only chat.message.sent events are handled; other events return 200 "ignored". Message dedupe by Kick-Event-Message-Id prevents replay. Public key cached for 1 hour, kept on refresh failure. Message ID comes from signed header (not data["id"]). Rejected requests logged sparingly. kick_bridge.py now needs aiohttp and rich (already in requirements.txt).
+- kick_gui.py: hint text no longer suggests port-forwarding; simple mode description no longer says "no verification".
+- README.md: mode table and dependency note updated; kick_bridge.py file description updated.
+- setup_kick_gui.bat / start_kick_bridge.bat: mode description and install instruction updated.
