@@ -36,6 +36,107 @@ MIN_EXPIRY_SAFETY_SECONDS = 1.0
 # loop we are trying to avoid.
 MIN_USABLE_SECONDS = 30.0
 
+# A token refresh that fails for a passing reason (no internet for a moment,
+# Kick briefly down) is retried after these waits, in seconds; the last one
+# repeats. Only Kick saying the login itself is no good turns sending off.
+REFRESH_RETRY_DELAYS = (30, 60, 120, 300, 600)
+# "Too many requests" from Kick: wait and try the same part again this many
+# times before giving up on the rest of the message.
+MAX_RATE_LIMIT_RETRIES = 2
+RATE_LIMIT_WAIT_S = 10.0          # when Kick doesn't say how long to wait
+RATE_LIMIT_MAX_WAIT_S = 30.0
+
+
+class _TokenFileLock:
+    """Only one program refreshes the shared tokens file at a time.
+
+    Kick hands out a NEW refresh token on every refresh and the old one stops
+    working. Two programs using the same kick_tokens.json (say the bridge and
+    a second copy) used to refresh in turn and each knock the other's token
+    out. With this lock, the second one waits, re-reads the file and uses the
+    fresh token instead of refreshing again. A lock left behind by a crash is
+    ignored after STALE_S seconds."""
+
+    STALE_S = 60.0
+    WAIT_S = 15.0
+
+    def __init__(self, path):
+        self.path = path + ".lock"
+        self.held = False
+
+    def __enter__(self):
+        end = time.time() + self.WAIT_S
+        while True:
+            try:
+                fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                os.write(fd, str(os.getpid()).encode())
+                os.close(fd)
+                self.held = True
+                return self
+            except FileExistsError:
+                try:
+                    if time.time() - os.path.getmtime(self.path) > self.STALE_S:
+                        os.remove(self.path)
+                        continue
+                except OSError:
+                    continue
+                if time.time() > end:
+                    print("[yellow]Kick: another program has held the token lock for a "
+                          "while - refreshing anyway")
+                    return self
+                time.sleep(0.1)
+            except OSError:
+                return self         # can't lock (read-only folder?) - carry on
+
+    def __exit__(self, *exc):
+        if self.held:
+            try:
+                os.remove(self.path)
+            except OSError:
+                pass
+            self.held = False
+
+
+def restrict_to_owner(path):
+    """Let only the current user read the file (it holds the bot's login).
+
+    os.chmod(0o600) does nothing useful on Windows: files on a data drive
+    usually inherit "Authenticated Users: Modify", so any other account on
+    the PC could read the tokens. On Windows, icacls removes the inherited
+    permissions and gives the current user alone full access. Returns True if
+    the restriction was applied. Never raises."""
+    if os.name != "nt":
+        try:
+            os.chmod(path, 0o600)
+            return True
+        except OSError:
+            return False
+    user = os.environ.get("USERNAME", "")
+    if not user:
+        return False
+    try:
+        import subprocess
+        r = subprocess.run(["icacls", path, "/inheritance:r", "/grant:r", f"{user}:F"],
+                           capture_output=True, text=True, timeout=15,
+                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def write_private_json(path, data):
+    """Write JSON so that only the current user can read it: the empty file
+    is locked down first, then filled, then swapped into place (the
+    permissions move with it)."""
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8"):
+        pass
+    restrict_to_owner(tmp)
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+    os.replace(tmp, path)
+    restrict_to_owner(path)
+
 
 def _default_tokens_file():
     return os.path.join(
@@ -63,7 +164,10 @@ class KickSender:
         self.tokens_file = tokens_file or _default_tokens_file()
         self.min_interval_s = 2.0 if min_interval_s is None else float(min_interval_s)
         self._transport = transport or self._http_post_json
-        self._lock = threading.Lock()
+        self._lock = threading.Lock()           # token state
+        self._send_lock = threading.Lock()      # one message at a time
+        self._retry_at = 0.0                    # after a passing refresh failure
+        self._refresh_failures = 0
         self._access = None
         self._refresh = None
         self._expires_at = 0.0
@@ -134,6 +238,52 @@ class KickSender:
                   "setup_kick_auth.py to re-authorize")
             self.enabled = False
             return None
+        if time.time() < self._retry_at:
+            return None             # waiting after a passing failure; said so already
+        with _TokenFileLock(self.tokens_file):
+            # Another program sharing the tokens file may have refreshed
+            # already: then its token is the good one, and refreshing with
+            # ours would fail (Kick retires a refresh token once used).
+            if self._adopt_newer_tokens_from_file() and self._access_still_good():
+                print(f"[green]Kick: using the access token another program just "
+                      f"refreshed ({reason})")
+                return self._access
+            return self._refresh_locked(reason)
+
+    def _access_still_good(self):
+        margin = self._safety_margin(self._lifetime) if self._lifetime else 60.0
+        return bool(self._access) and time.time() < self._expires_at - margin
+
+    def _adopt_newer_tokens_from_file(self):
+        """Take the tokens file's pair if it's newer than ours. True if so."""
+        try:
+            with open(self.tokens_file, "r", encoding="utf-8") as f:
+                t = json.load(f)
+        except (OSError, ValueError):
+            return False
+        refresh = t.get("refresh_token")
+        access = t.get("access_token")
+        expires_at = float(t.get("expires_at") or 0)
+        if not (access and refresh) or refresh == self._refresh or expires_at < self._expires_at:
+            return False
+        self._access, self._refresh = access, refresh
+        self._expires_at = expires_at
+        self._lifetime = float(t.get("expires_in") or self._lifetime or 0)
+        self.enabled = True
+        return True
+
+    @staticmethod
+    def _login_rejected(error):
+        """True when Kick turned down the refresh token or app credentials
+        themselves (re-authorizing is the only fix). Anything else - no
+        connection, a timeout, Kick having a moment - is worth retrying."""
+        code = getattr(error, "code", None)
+        if code in (400, 401, 403):
+            return True
+        text = str(error).lower()
+        return any(w in text for w in ("invalid_grant", "invalid_client", "unauthorized_client"))
+
+    def _refresh_locked(self, reason):
         try:
             started_at = time.time()  # anchor BEFORE the call
             resp = self._transport(self.TOKEN_URL, {
@@ -146,7 +296,9 @@ class KickSender:
             refresh = resp.get("refresh_token")
             expires_in = int(resp.get("expires_in") or 0)
             if not access or not refresh:
-                raise ValueError(f"bad refresh response: {json.dumps(resp)[:200]}")
+                # Name the fields, never their values: a half-good response can
+                # still hold a live token, and this message goes to the log.
+                raise ValueError(f"bad refresh response (fields: {sorted(resp)[:10]})")
             if expires_in <= 0:
                 raise ValueError("refresh response has no usable expires_in")
             margin = self._safety_margin(expires_in)
@@ -161,15 +313,31 @@ class KickSender:
             self._lifetime = float(expires_in)
             self._save_tokens()
             self.enabled = True
+            self._refresh_failures = 0
+            self._retry_at = 0.0
             print(f"[green]Kick: access token refreshed ({reason}), good for "
                   f"{expires_in/60:.0f} min, {margin/60:.0f} min reserved")
             return self._access
         except Exception as e:
-            self.enabled = False
-            print(f"[red]Kick: token refresh FAILED ({reason}) - "
-                  f"{type(e).__name__}: {str(e)[:200]}")
-            print("[red]Kick: chat sending is now OFF. Re-run "
-                  "setup_kick_auth.py (approve as the bot account) to fix.")
+            detail = f"{type(e).__name__}: {str(e)[:200]}"
+            if self._login_rejected(e):
+                # One last look: another program may have swapped the token
+                # between our read and our refresh.
+                if self._adopt_newer_tokens_from_file():
+                    print("[yellow]Kick: our refresh token was already used by another "
+                          "program; switched to the newer one in the tokens file")
+                    return self._access if self._access_still_good() else None
+                self.enabled = False
+                print(f"[red]Kick: token refresh REJECTED ({reason}) - {detail}")
+                print("[red]Kick: chat sending is now OFF. Re-run "
+                      "setup_kick_auth.py (approve as the bot account) to fix.")
+                return None
+            # A passing problem: keep sending switched on, wait, try again.
+            delay = REFRESH_RETRY_DELAYS[min(self._refresh_failures, len(REFRESH_RETRY_DELAYS) - 1)]
+            self._refresh_failures += 1
+            self._retry_at = time.time() + delay
+            print(f"[yellow]Kick: couldn't refresh the access token ({reason}) - {detail}. "
+                  f"Replies to Kick are paused; trying again in {delay}s.")
             return None
 
     def refresh_now(self):
@@ -181,8 +349,18 @@ class KickSender:
         a dead refresh_token obvious at boot instead of mid-stream.
 
         Returns True when a usable access token is held. Never raises.
+
+        A token that is still good is kept, not refreshed: refreshing retires
+        the refresh token, which would knock out any other program using the
+        same tokens file.
         """
         with self._lock:
+            self._adopt_newer_tokens_from_file()
+            if self._access_still_good():
+                left = (self._expires_at - time.time()) / 60
+                print(f"[green]Kick: access token still good for {left:.0f} min - "
+                      "no refresh needed at startup")
+                return True
             return self._do_refresh("startup") is not None
 
     def _load_broadcaster(self):
@@ -205,22 +383,15 @@ class KickSender:
                   f"{type(e).__name__}: {str(e)[:120]}")
 
     def _save_tokens(self):
-        tmp = self.tokens_file + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump({
-                "access_token": self._access,
-                "refresh_token": self._refresh,
-                "expires_at": self._expires_at,
-                "expires_in": self._lifetime,
-                "scope": self._scope,
-                "authorized_as": self._who,
-                "created_at": self._created,
-            }, f, indent=2)
-        os.replace(tmp, self.tokens_file)
-        try:
-            os.chmod(self.tokens_file, 0o600)
-        except OSError:
-            pass
+        write_private_json(self.tokens_file, {
+            "access_token": self._access,
+            "refresh_token": self._refresh,
+            "expires_at": self._expires_at,
+            "expires_in": self._lifetime,
+            "scope": self._scope,
+            "authorized_as": self._who,
+            "created_at": self._created,
+        })
 
     def _ensure_access(self):
         """Returns a valid access token or None. Thread-safe."""
@@ -258,7 +429,8 @@ class KickSender:
         if resp.status_code != 200:
             raise urllib.error.HTTPError(
                 self.CHAT_URL, resp.status_code,
-                f"HTTP {resp.status_code}: {resp.text[:200]}", {}, None)
+                f"HTTP {resp.status_code}: {resp.text[:200]}",
+                dict(resp.headers or {}), None)     # headers: Retry-After on 429
         return resp.json()
 
     # ---- public API ----
@@ -279,11 +451,13 @@ class KickSender:
                 chunks.append(text[:limit].strip())
                 text = text[limit:].lstrip()
                 continue
-            chunks.append(text[:cut].strip())
-            # step past the separator so the next chunk never starts with ". "
             if text[cut] == ".":
+                # Keep the full stop with its sentence (it used to be cut off:
+                # "...the end" + "Next sentence"), then skip the space.
+                chunks.append(text[:cut + 1].strip())
                 text = text[cut + 2:].lstrip()
             else:
+                chunks.append(text[:cut].strip())
                 text = text[cut + 1:].lstrip()
         if text:
             chunks.append(text)
@@ -295,48 +469,76 @@ class KickSender:
             time.sleep(wait)
 
     def send(self, text):
-        """Post text (auto-split at 500 chars). Returns count sent."""
+        """Post text (auto-split at 500 chars). Returns count sent.
+
+        One message at a time: a second send() waits until the first has
+        posted all its parts, so two replies never get mixed together in
+        Kick chat (the bridge sends from more than one thread)."""
         if not self.enabled:
             return 0
         chunks = self.split_message(text)
-        sent = 0
-        for chunk in chunks:
-            if self._send_one(chunk):
-                sent += 1
-            else:
-                break  # auth/rate problem - don't hammer
-        return sent
+        with self._send_lock:
+            sent = 0
+            for chunk in chunks:
+                if self._send_one(chunk):
+                    sent += 1
+                else:
+                    break  # auth problem or still rate limited - don't hammer
+            if 0 < sent < len(chunks):
+                print(f"[yellow]Kick: only {sent} of {len(chunks)} parts of the reply were sent")
+            return sent
+
+    @staticmethod
+    def _retry_after(error):
+        try:
+            value = float((error.headers or {}).get("Retry-After"))
+        except (TypeError, ValueError, AttributeError):
+            return RATE_LIMIT_WAIT_S
+        return max(1.0, min(value, RATE_LIMIT_MAX_WAIT_S))
 
     def _send_one(self, content):
-        bearer = self._ensure_access()
-        if not bearer:
-            return False
         if not self._broadcaster_user_id:
             print(f"[red]Kick sender: no target channel (KICK_CHANNEL={self._target_slug or '(empty)'})")
             return False
-        self._throttle()
         payload = {"broadcaster_user_id": self._broadcaster_user_id,
                    "content": content[:500], "type": "user"}
-        try:
-            resp = self._post_chat_api(payload, bearer)
-            self._last_send = time.time()
-            data = resp.get("data") or {}
-            if data.get("is_sent"):
-                return True
-            print(f"[red]Kick send refused: {json.dumps(resp)[:200]}")
-            return False
-        except urllib.error.HTTPError as e:
-            body = ""
+        rate_limited = 0
+        reauthed = False
+        while True:
+            bearer = self._ensure_access()
+            if not bearer:
+                return False
+            self._throttle()
             try:
-                body = e.read().decode()[:200]
-            except Exception:
-                pass
-            if e.code == 429:
-                print("[yellow]Kick rate limited (429) - backing off")
-                self._last_send = time.time() + 25
-            else:
-                print(f"[red]Kick send failed ({e.code}): {body}")
-            return False
-        except Exception as e:
-            print(f"[red]Kick send error: {type(e).__name__}: {str(e)[:200]}")
-            return False
+                resp = self._post_chat_api(payload, bearer)
+                self._last_send = time.time()
+                data = resp.get("data") or {}
+                if data.get("is_sent"):
+                    return True
+                print(f"[red]Kick send refused: {json.dumps(resp)[:200]}")
+                return False
+            except urllib.error.HTTPError as e:
+                self._last_send = time.time()
+                if e.code == 429 and rate_limited < MAX_RATE_LIMIT_RETRIES:
+                    # Wait and send the same part again; the rest of the
+                    # message used to be dropped here.
+                    rate_limited += 1
+                    wait = self._retry_after(e)
+                    print(f"[yellow]Kick rate limited (429) - waiting {wait:.0f}s, then "
+                          f"trying again ({rate_limited}/{MAX_RATE_LIMIT_RETRIES})")
+                    time.sleep(wait)
+                    continue
+                if e.code == 401 and not reauthed:
+                    # The access token stopped working early (revoked, or
+                    # refreshed by another program): refresh once, try again.
+                    reauthed = True
+                    with self._lock:
+                        self._expires_at = 0.0
+                    print("[yellow]Kick said the access token is no longer valid - "
+                          "refreshing and trying again")
+                    continue
+                print(f"[red]Kick send failed ({e.code}): {str(e)[:200]}")
+                return False
+            except Exception as e:
+                print(f"[red]Kick send error: {type(e).__name__}: {str(e)[:200]}")
+                return False

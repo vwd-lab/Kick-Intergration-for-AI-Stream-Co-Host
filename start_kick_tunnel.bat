@@ -10,13 +10,22 @@ REM ---------------------------------------------------------------------------
 setlocal
 set "HERE=%~dp0"
 
-where python >nul 2>&1
-if errorlevel 1 (
-    echo [kick-tunnel] python not found on PATH.
-    exit /b 1
+REM Use the kit's own venv when there is one (that's where requirements.txt
+REM was installed); otherwise whatever "python" is on PATH.
+set "PY=python"
+if exist "%HERE%.venv\Scripts\python.exe" set "PY=%HERE%.venv\Scripts\python.exe"
+if exist "%HERE%venv\Scripts\python.exe" set "PY=%HERE%venv\Scripts\python.exe"
+if "%PY%"=="python" (
+    where python >nul 2>&1
+    if errorlevel 1 (
+        echo [kick-tunnel] python not found on PATH, and no venv in this folder.
+        exit /b 1
+    )
 )
 
-echo [kick-tunnel] starting cloudflared quick tunnel...
-start "kick-tunnel" /min python "%HERE%kick_tunnel_host.py"
+echo [kick-tunnel] starting cloudflared quick tunnel with "%PY%"...
+echo [kick-tunnel] its window is minimised on the taskbar ("kick-tunnel") - the
+echo              public URL is shown there and written to data\kick_tunnel_url.txt
+start "kick-tunnel" /min "%PY%" "%HERE%kick_tunnel_host.py"
 endlocal
 exit /b 0

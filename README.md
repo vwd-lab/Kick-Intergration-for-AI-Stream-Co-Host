@@ -60,7 +60,7 @@ The GUI can launch either:
 | Mode | Script | Best for |
 |---|---|---|
 | **production** (default) | `demo_main.py` | Kick signature verification, tunnel health watchdog, token refresh. Recommended for actual streaming. |
-| **simple** | `kick_bridge.py` | Single file. Checks Kick's signature on every request (same check as production) but has no tunnel watchdog or token refresh. |
+| **simple** | `kick_bridge.py` | Single file. Checks Kick's signature on every request (same check as production) but has no tunnel watchdog. Text replies use the same sender as production (needs the one-time `setup_kick_auth.py`). |
 
 Both need the packages in `requirements.txt` (`requests`, `aiohttp`, `rich`): simple mode reuses the production signature checker. Install them with `python -m pip install -r requirements.txt`.
 
@@ -72,17 +72,38 @@ These steps are required before Kick chat will flow:
 
 ### 1. Register a Kick developer app
 Go to https://developers.kick.com/ and create an app. Note the **Client ID**
-and **Client Secret**. Set a redirect URI for OAuth (e.g. `http://localhost`
-for testing).
+and **Client Secret**. Add this redirect URI to the app - `setup_kick_auth.py`
+listens on exactly this address:
 
-### 2. Authorize the bot account (one time)
+```
+http://localhost:4519/callback
+```
+
+### 2. Configure `.env`
+Copy `.env.example` to `.env` and fill in at minimum (the scripts in the next
+steps read it):
+
+```
+KICK_ENABLED=1
+KICK_CHANNEL=yourchannelslug
+KICK_CLIENT_ID=...
+KICK_CLIENT_SECRET=...
+KICK_TEXT_REPLIES=1
+KICK_COMMAND_PREFIX=!ask
+```
+
+`KICK_CHANNEL` is the part after `kick.com/`. `KICK_WEBHOOK_URL` is added in
+step 4, once the tunnel gives you its address.
+
+### 3. Authorize the bot account (one time)
 Run `setup_kick_auth.py` while logged into Kick as the account that will post
-replies. This writes `kick_tokens.json` with an access token + refresh token.
-Kick access tokens live only ~2 hours, so `demo_main.py` refreshes
-automatically at startup and before each send.
+replies. This writes `kick_tokens.json` with an access token + refresh token
+(readable only by your Windows account). Kick access tokens live only
+~2 hours, so they're refreshed automatically whenever they're about to run
+out - in both modes. A network blip just pauses replies and retries.
 
-### 3. Start a public tunnel (required)
-Kick POSTs webhooks from its own servers to a public HTTPS URL — `localhost`
+### 4. Start a public tunnel (required)
+Kick POSTs webhooks from its own servers to a public HTTPS URL - `localhost`
 won't work. Run:
 
 ```bat
@@ -92,9 +113,14 @@ python kick_tunnel_host.py
 This starts cloudflared and prints a public URL like
 `https://xxxx.us.trycloudflare.com`. It also writes
 `data\kick_tunnel_url.txt` so the bridge can pick up hostname changes without
-a restart.
+a restart. Put that URL in `.env` (without the `/kick/events` path - the
+bridge adds that):
 
-### 4. Subscribe the webhook
+```
+KICK_WEBHOOK_URL=https://xxxx.us.trycloudflare.com
+```
+
+### 5. Subscribe the webhook
 ```bat
 python setup_kick_webhook.py subscribe
 ```
@@ -104,22 +130,6 @@ Tell Kick to POST `chat.message.sent` events to your public tunnel URL plus
 ```
 https://xxxx.us.trycloudflare.com/kick/events
 ```
-
-### 5. Configure `.env`
-Copy `.env.example` to `.env` and fill in at minimum:
-
-```
-KICK_ENABLED=1
-KICK_CHANNEL=yourchannelslug
-KICK_CLIENT_ID=...
-KICK_CLIENT_SECRET=...
-KICK_WEBHOOK_URL=https://xxxx.us.trycloudflare.com
-KICK_TEXT_REPLIES=1
-KICK_COMMAND_PREFIX=!ask
-```
-
-`KICK_CHANNEL` is the part after `kick.com/`. `KICK_WEBHOOK_URL` is the
-public tunnel URL (without the `/kick/events` path — the bridge adds that).
 
 ### 6. Launch
 
@@ -154,14 +164,16 @@ python demo_main.py
 | `adapter_base.py` | Abstract adapter class to subclass |
 | `adapter_radeon_cohost.py` | Shim for Radeon AI Co-Host |
 | `adapter_http.py` | HTTP callback adapter + example Flask endpoint |
-| `messages.json` | File mailbox (created at runtime, `file` adapter) |
+| `kick_mailbox.py` | The mailbox shared with Radeon AI Co-Host: `mailbox/inbox` (chat in), `mailbox/outbox` (replies out), one file per message |
+| `mailbox/` | Mailbox folder (created at runtime, git-ignored). Replaces the old `messages.json`, which lost messages |
 | `kick_tokens.json` | OAuth tokens (created at runtime, git-ignored) |
 | `data/kick_tunnel_url.txt` | Current tunnel hostname (created at runtime) |
 
 ## Requirements
 
 - Python 3
-- `pip install requests aiohttp`
+- `pip install -r requirements.txt` (requests, aiohttp, rich, python-dotenv - without
+  python-dotenv the settings in `.env` are silently ignored)
 
 The GUI (`kick_gui.py`) uses tkinter only, so no extra packages are needed
 to launch.

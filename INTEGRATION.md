@@ -188,8 +188,17 @@ KickSender(
 | Member | Notes |
 |---|---|
 | `enabled` | True when credentials and a token pair are present. |
-| `refresh_now()` | Refreshes before the first send. Returns bool. Never raises. |
-| `send(text)` | Splits at 500 chars, throttles, returns the number of chunks sent. Stops at the first failure. |
+| `refresh_now()` | Makes sure there's a usable access token before the first send (refreshes only if the stored one has run out). Returns bool. Never raises. |
+| `send(text)` | Splits at 500 chars, throttles, returns the number of chunks sent. One message at a time, so two replies never interleave. On a 429 it waits (Retry-After, up to 30 s) and resends the same part, up to twice; on a 401 it refreshes once and retries. Stops at the first part that still fails. |
+
+Token refresh: only Kick rejecting the login itself (HTTP 400/401/403,
+`invalid_grant`) turns sending off - re-run `setup_kick_auth.py` then. A
+network blip or a Kick outage pauses replies and retries after 30 s, 1, 2, 5,
+then every 10 min. Several programs can share one `kick_tokens.json`: a
+refresh is done under a lock file (`kick_tokens.json.lock`), and a program
+that finds a newer token in the file uses it instead of refreshing again
+(Kick retires a refresh token once it's used).
+
 | `split_message(text, limit=500)` | Static helper; splits on sentence/word boundaries and never drops characters. |
 
 `target_slug` is resolved to `broadcaster_user_id` through Kick's public v2
@@ -203,8 +212,9 @@ account is approved on the app.
 
 - The HTTP server and the health watchdog each run on daemon threads.
 - `message_queue` is a standard `queue.Queue`; safe across threads.
-- `KickSender.send()` is thread-safe (internal lock) but **blocks** while it
-  throttles and performs HTTP. Call it from a worker if your queue consumer
+- `KickSender.send()` is thread-safe - concurrent calls are sent one whole
+  message at a time - but **blocks** while it throttles and performs HTTP
+  (and while it waits out a rate limit). Call it from a worker if your queue consumer
   must stay responsive.
 - `on_ambient` runs on the HTTP thread. Keep it cheap and thread-safe.
 
@@ -214,23 +224,37 @@ account is approved on the app.
   SHA-256, pure stdlib). Unverifiable requests get HTTP 401 and are counted.
 - The key is fetched live and cached for one hour, so a rotation does not
   require a restart.
-- Message ids are deduped in a bounded (2000-entry) cache; replays get HTTP
-  200 so Kick stops retrying.
+- Replay protection (`ReplayGuard`, shared by production and simple mode):
+  - a message whose **signed** time is more than 5 minutes off is ignored
+    (an old captured message resent, or a PC clock that's wrong - the
+    console says which to check);
+  - handled message ids are remembered for a day **on disk**
+    (`data/kick_seen_ids.json`, simple mode `data/kick_seen_ids_simple.json`),
+    so a restart doesn't make an old message new again;
+  - Kick's documented signature covers `<id>.<timestamp>.<body>`. A
+    body-only signature (as in Kick's sample code) is still accepted, but
+    then the id and time come from inside the signed body (`message_id`,
+    `created_at`), never from the unsigned headers; without a `message_id`
+    such a message is ignored.
+  All of these get HTTP 200 (not an error), so Kick stops retrying and
+  doesn't count them as failed deliveries.
 - A payload whose `broadcaster.channel_slug` does not match `channel_slug` is
   ignored (when the slug is present).
-- `setup_kick_auth.py` writes the token file with mode `0600` where the OS
-  supports it. Never commit it.
+- `kick_tokens.json`, `config.json` and `.env` hold secrets. They're written
+  so only the current user can read them (on Windows with `icacls`, since
+  `chmod 0600` does nothing there), and they're in `.gitignore`. Never commit
+  them.
 
 ## HTTP endpoints
 
 | Path | Method | Purpose |
 |---|---|---|
 | `/kick/events` | POST | Kick's webhook target. |
-| `/kick/status` | GET | JSON counters and tunnel health. |
+| `/kick/status` | GET | JSON counters and tunnel health. Through the tunnel (from the internet) it only answers `{"ok": true}`; the details are for this PC. |
 | `/health` | GET | Alias for `/kick/status`. |
 
 `status()` fields: `channel`, `port`, `received`, `verified`, `rejected`,
-`tunnel_ok`, `last_event_seconds_ago`, `public_url`, `note`.
+`stale` (ignored as too old), `tunnel_ok`, `last_event_seconds_ago`, `public_url`, `note`.
 
 ## Setup sequence
 

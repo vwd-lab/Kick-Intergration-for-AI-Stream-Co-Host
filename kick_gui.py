@@ -12,9 +12,120 @@ import json
 import os
 import subprocess
 import sys
+import queue
 import threading
 import tkinter as tk
 from tkinter import ttk, messagebox, scrolledtext
+
+# ---------------------------------------------------------------------------
+# Running the bridge without freezing the window
+# (The same code is used in the OBS, Discord and Kick GUIs.)
+# ---------------------------------------------------------------------------
+
+class BridgeProcess:
+    """Runs a bridge script and collects its output without ever blocking the
+    window.
+
+    Before, the GUI called stdout.readline() on the window's own thread, which
+    waits until the bridge prints something - so the window froze ("Not
+    Responding") whenever the bridge was quiet, and Stop couldn't be clicked.
+    Now a background thread reads the output into a queue and the window only
+    takes what's already there.
+
+    Also:
+    - the bridge's output is unbuffered UTF-8, so lines show up right away and
+      emoji/accents in chat can't crash its printing;
+    - Stop asks the bridge to shut down cleanly first (by closing its stdin;
+      the bridge treats that like Ctrl+C and runs its own cleanup, e.g. hiding
+      the OBS image) and only forces it if it hasn't exited after a grace
+      period. Before, Stop killed it outright and the cleanup never ran.
+    """
+
+    def __init__(self, script, cwd):
+        env = {**os.environ,
+               "PYTHONUNBUFFERED": "1",        # print lines immediately
+               "PYTHONIOENCODING": "utf-8",    # emoji/accents can't crash printing
+               "BRIDGE_GUI_CHILD": "1"}        # "stdin closed" means "please stop"
+        self.proc = subprocess.Popen(
+            [sys.executable or "python", "-u", script],
+            cwd=cwd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+            env=env,
+        )
+        self.pid = self.proc.pid
+        self.finished = False           # True once all output has been read
+        self._lines = queue.Queue()
+        self._stopping = False
+        threading.Thread(target=self._read_output, daemon=True).start()
+
+    def _read_output(self):
+        try:
+            for line in self.proc.stdout:
+                self._lines.put(line.rstrip("\r\n"))
+        except (OSError, ValueError):
+            pass
+        finally:
+            self._lines.put(None)       # end of output
+
+    def poll(self):
+        return self.proc.poll()
+
+    @property
+    def returncode(self):
+        return self.proc.returncode
+
+    def drain(self, limit=500):
+        """Lines printed since the last call. Never waits."""
+        out = []
+        for _ in range(limit):
+            try:
+                item = self._lines.get_nowait()
+            except queue.Empty:
+                break
+            if item is None:
+                self.finished = True
+                break
+            out.append(item)
+        return out
+
+    def request_stop(self, grace_s=8.0):
+        """Ask for a clean stop, then force it after grace_s. Returns at once."""
+        if self._stopping:
+            return
+        self._stopping = True
+        threading.Thread(target=self._stop, args=(grace_s,), daemon=True).start()
+
+    def _stop(self, grace_s):
+        try:
+            self.proc.stdin.close()
+        except OSError:
+            pass
+        try:
+            self.proc.wait(timeout=grace_s)
+            return
+        except subprocess.TimeoutExpired:
+            pass
+        self._lines.put(f"[bridge didn't stop within {grace_s:.0f}s - forcing it]")
+        self.proc.terminate()
+        try:
+            self.proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            self.proc.kill()
+
+    def stop_and_wait(self, timeout=12.0):
+        """For closing the window: stop and wait (bounded)."""
+        self.request_stop()
+        try:
+            self.proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            self.proc.kill()
+
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(ROOT, "config.json")
@@ -49,6 +160,15 @@ def load_config():
 
 
 def save_config(cfg):
+    # config.json holds the app's client secret: when the kit's packages are
+    # installed, write it so only this Windows account can read it.
+    try:
+        from input.kick_sender import write_private_json
+    except Exception:
+        write_private_json = None
+    if write_private_json is not None:
+        write_private_json(CONFIG_PATH, cfg)
+        return
     with open(CONFIG_PATH, "w", encoding="utf-8") as f:
         json.dump(cfg, f, indent=2)
 
@@ -150,7 +270,7 @@ class KickBridgeGUI(tk.Tk):
         ).pack(side=tk.LEFT)
         ttk.Label(
             right,
-            text="file = shared messages.json (Radeon AI Co-Host, any language)\n"
+            text="file = shared mailbox folder (Radeon AI Co-Host, any language)\n"
                  "http  = POST each message to your bot's callback URL",
             wraplength=320, foreground="#666666",
         ).pack(anchor=tk.W, pady=(4, 0))
@@ -218,7 +338,7 @@ class KickBridgeGUI(tk.Tk):
             "Kick AI Bridge\n\n"
             "Framework-agnostic Kick chat bridge. Receives Kick webhook\n"
             "messages and hands them to your bot adapter:\n\n"
-            "  • file  — shared messages.json mailbox\n"
+            "  • file  — shared mailbox folder (one file per message)\n"
             "        (plugs into Radeon AI Co-Host or any custom bot)\n"
             "  • http  — POSTs each message to your bot's callback URL\n\n"
             "Requires: Python 3, requests\n"
@@ -276,16 +396,8 @@ class KickBridgeGUI(tk.Tk):
         else:
             script = os.path.join(ROOT, "kick_bridge.py")
             mode_label = "simple"
-        python = sys.executable or "python"
         try:
-            self.process = subprocess.Popen(
-                [python, script],
-                cwd=ROOT,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1,
-            )
+            self.process = BridgeProcess(script, ROOT)
         except Exception as e:
             messagebox.showerror("Start failed", str(e))
             return
@@ -299,42 +411,33 @@ class KickBridgeGUI(tk.Tk):
             self._log_ui("[warn] No public webhook URL set — Kick cannot reach this bridge.")
 
     def _stop_bridge(self):
+        """Ask the bridge to stop cleanly. Returns at once; _poll_process
+        notices when it has exited and resets the buttons."""
         if self.process is None:
             return
-        try:
-            self.process.terminate()
-            self.process.wait(timeout=5)
-        except Exception:
-            try:
-                self.process.kill()
-            except Exception:
-                pass
+        self.process.request_stop()
+        self.btn_stop.configure(state=tk.DISABLED)
+        self.status_var.set("Stopping...")
+        self._log_ui("Stopping the bridge (letting it clean up)...")
+
+    def _set_stopped(self):
         self.process = None
         self.btn_start.configure(state=tk.NORMAL)
         self.btn_stop.configure(state=tk.DISABLED)
         self.status_var.set("Stopped")
-        self._log_ui("Bridge stopped.")
 
     # ------------------------------------------------------------------ log plumbing
 
     def _poll_process(self):
-        """Read subprocess stdout line by line and queue for GUI display."""
-        if self.process is None:
-            self.after(200, self._poll_process)
-            return
-        line = self.process.stdout.readline()
-        if line:
-            self.log_queue.append(line.rstrip("\n"))
-        if self.process.poll() is not None:
-            remaining = self.process.stdout.read()
-            if remaining:
-                for ln in remaining.splitlines():
-                    self.log_queue.append(ln)
-            self._log_ui(f"[process exited code {self.process.returncode}]")
-            self.process = None
-            self.btn_start.configure(state=tk.NORMAL)
-            self.btn_stop.configure(state=tk.DISABLED)
-            self.status_var.set("Stopped")
+        """Show whatever the bridge has printed so far. Never waits for
+        output - the old readline() here froze the window."""
+        proc = self.process
+        if proc is not None:
+            self.log_queue.extend(proc.drain())
+            if proc.finished and proc.poll() is not None:
+                self.log_queue.append(f"[process exited code {proc.returncode}]")
+                self.log_queue.append("Bridge stopped.")
+                self._set_stopped()
         self.after(100, self._poll_process)
 
     def _poll_log_queue(self):
@@ -351,7 +454,10 @@ class KickBridgeGUI(tk.Tk):
         self.log_text.delete("1.0", tk.END)
 
     def on_closing(self):
-        self._stop_bridge()
+        if self.process is not None:
+            self.status_var.set("Stopping...")
+            self.update_idletasks()
+            self.process.stop_and_wait()
         self.destroy()
 
 

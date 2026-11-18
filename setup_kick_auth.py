@@ -13,6 +13,7 @@ The redirect URI must be registered on your Kick app:
 """
 import base64
 import hashlib
+import html
 import json
 import os
 import secrets
@@ -62,9 +63,12 @@ class CallbackHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "text/html")
         self.end_headers()
         ok = bool(captured["code"]) and not captured["error"]
+        # The error text comes from the address bar, so it's escaped before
+        # going into the page (otherwise a crafted link could inject HTML or
+        # script into this local page).
         msg = ("<h2>Authorization captured. You can close this tab "
                "and return to the terminal.</h2>" if ok else
-               f"<h2>Authorization FAILED: {captured['error']}</h2>")
+               f"<h2>Authorization FAILED: {html.escape(captured['error'])}</h2>")
         self.wfile.write(msg.encode())
 
     def log_message(self, *args):
@@ -181,12 +185,10 @@ def main():
     parent = os.path.dirname(path)
     if parent:
         os.makedirs(parent, exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(tokens, f, indent=2)
-    try:
-        os.chmod(path, 0o600)
-    except OSError:
-        pass
+    # Only this Windows account may read the tokens (os.chmod alone does
+    # nothing useful on Windows).
+    from input.kick_sender import write_private_json
+    write_private_json(path, tokens)
 
     print(f"\n[OK] Authorized as: {whoami}")
     print(f"[OK] Scopes granted : {granted_scope or '(unspecified)'}")

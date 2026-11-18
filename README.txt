@@ -139,8 +139,9 @@ problem: Kick cannot reach the receiver.
   4. Optional: set KICK_BOT_ACCOUNT=yourbotname. This sanity-checks the OAuth
      result and ignores the bot's own messages if Kick echoes them.
 
-Tokens last ~2 hours; KickSender refreshes them before every send. If the
-refresh token is revoked, sending turns itself off and logs the fix.
+Tokens last ~2 hours; KickSender refreshes them when needed. If the refresh
+token is revoked, sending turns itself off and logs the fix. A network blip
+only pauses replies; it tries again by itself.
 
 Without this step the receiver still works; replies just stay local.
 

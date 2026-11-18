@@ -9,7 +9,9 @@ from its own servers and this receiver listens on localhost.
 
 Security: every request is verified against Kick's RSA public key before the
 payload is looked at. Kick can rotate that key, so it is fetched live and
-cached, never hardcoded.
+cached, never hardcoded. A verified message is then checked for replays
+(ReplayGuard): its signed time must be recent, and ids already handled are
+remembered on disk, so a captured message can't be accepted again later.
 
 Standalone: this module imports only the stdlib, `requests`, `aiohttp` and
 `rich`. It reads no config and no environment variables; pass everything to
@@ -39,6 +41,37 @@ BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
 DEFAULT_URL_FILE = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
     "data", "kick_tunnel_url.txt")
+
+# Replay protection: messages already handled are remembered here (and so
+# across restarts), and a signed message older/newer than MAX_AGE_S is ignored.
+DEFAULT_SEEN_FILE = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "data", "kick_seen_ids.json")
+MAX_AGE_S = 300            # 5 minutes either way (allows for a slightly-off PC clock)
+SEEN_KEEP_S = 24 * 3600    # forget handled message ids after a day
+
+_RFC3339 = re.compile(r"^(\d{4})-(\d\d)-(\d\d)[Tt ](\d\d):(\d\d):(\d\d)(\.\d+)?"
+                      r"(?:([Zz])|([+-])(\d\d):?(\d\d))$")
+
+
+def parse_rfc3339(text):
+    """Kick's timestamps ("2025-01-14T16:08:06Z", maybe with .ms or +hh:mm)
+    -> seconds since 1970, or None if it isn't in that form."""
+    import calendar
+    m = _RFC3339.match((text or "").strip())
+    if not m:
+        return None
+    y, mo, d, h, mi, s, frac, z, sign, oh, om = m.groups()
+    try:
+        epoch = calendar.timegm((int(y), int(mo), int(d), int(h), int(mi), int(s), 0, 0, 0))
+    except (ValueError, OverflowError):
+        return None
+    epoch += float(frac) if frac else 0.0
+    if not z and sign:
+        offset = int(oh) * 3600 + int(om) * 60
+        epoch -= offset if sign == "+" else -offset
+    return epoch
+
 
 # DigestInfo prefix for id-sha256 (RFC 8017 A.2.4)
 _SHA256_DIGEST_INFO_PREFIX = bytes.fromhex("3031300d060960864801650304020105000420")
@@ -138,6 +171,113 @@ def fetch_public_key(timeout=20):
 
 # --------------------------------------------------------------------------
 
+class ReplayGuard:
+    """Decides whether a Kick webhook that passed the signature check is new.
+
+    Kick signs "<message id>.<timestamp>.<body>" ("full"). Its own sample code
+    signs the body alone ("body"); that's accepted too, but then the id and
+    timestamp HEADERS aren't covered by the signature - anyone could resend a
+    captured body with new ones - so the id and time are taken from inside
+    the signed body instead (Kick puts "message_id" and "created_at" there).
+
+    check() returns:
+      "ok"         new - handle it
+      "duplicate"  handled before (also across restarts: ids are kept on disk)
+      "stale"      sent more than MAX_AGE_S ago (or ahead) - an old one resent,
+                   or this PC's clock is wrong
+      "no-id"      body-only signature with no message id in the body, so a
+                   resend can't be told apart from a new message
+    Answer all of these "200 OK": Kick unsubscribes a webhook whose
+    deliveries keep failing, and a resend isn't Kick's fault.
+    """
+
+    def __init__(self, seen_file=None, log=None, max_items=2000):
+        self.seen_file = seen_file or DEFAULT_SEEN_FILE
+        self._log = log or (lambda msg: print(f"[yellow]{msg}"))
+        self._max = max_items
+        self._seen = OrderedDict()          # replay key -> time first seen
+        self._lock = threading.Lock()
+        self._warned_at = 0.0
+        self._body_only_noted = False
+        self.stale = 0
+        self._load()
+
+    def check(self, mode, headers, payload):
+        body_id = ""
+        if isinstance(payload, dict):
+            body_id = str(payload.get("message_id") or "")
+        if mode == "full":
+            header_id = headers.get("Kick-Event-Message-Id", "")
+            sent_at = parse_rfc3339(headers.get("Kick-Event-Message-Timestamp", ""))
+            keys = [f"id:{header_id}"] + ([f"msg:{body_id}"] if body_id else [])
+        else:
+            if not self._body_only_noted:
+                self._body_only_noted = True
+                self._log("Kick webhook: Kick signed the message body only; using the "
+                          "message's own id and time for replay checks.")
+            if not body_id:
+                return "no-id"
+            sent_at = parse_rfc3339(str(payload.get("created_at") or ""))
+            keys = [f"msg:{body_id}"]
+        if self._too_old(sent_at):
+            return "stale"
+        if self._seen_before(keys):
+            return "duplicate"
+        return "ok"
+
+    def _too_old(self, sent_at):
+        if sent_at is None:
+            return False        # no signed time to judge by: rely on the ids
+        off = time.time() - sent_at
+        if abs(off) <= MAX_AGE_S:
+            return False
+        self.stale += 1
+        if time.time() - self._warned_at > 600:
+            self._warned_at = time.time()
+            when = "ago" if off > 0 else "in the future"
+            self._log(f"Kick webhook: ignored a message sent {abs(off) / 60:.0f} min {when} "
+                      "(an old one resent, or this PC's clock is off - check Windows' "
+                      "date and time).")
+        return True
+
+    def _seen_before(self, keys):
+        """True if any key was handled before; otherwise remember them all,
+        in memory and on disk, so a restart doesn't make an old message new."""
+        with self._lock:
+            if any(k in self._seen for k in keys):
+                return True
+            now = time.time()
+            for k in keys:
+                self._seen[k] = now
+            cutoff = now - SEEN_KEEP_S
+            while self._seen and (len(self._seen) > self._max
+                                  or next(iter(self._seen.values())) < cutoff):
+                self._seen.popitem(last=False)
+            self._save()
+        return False
+
+    def _load(self):
+        try:
+            with open(self.seen_file, encoding="utf-8") as f:
+                data = json.load(f)
+            cutoff = time.time() - SEEN_KEEP_S
+            for k, t in sorted(data.items(), key=lambda kv: kv[1]):
+                if isinstance(t, (int, float)) and t > cutoff:
+                    self._seen[str(k)] = float(t)
+        except (OSError, ValueError, AttributeError, TypeError):
+            pass
+
+    def _save(self):
+        try:
+            os.makedirs(os.path.dirname(self.seen_file), exist_ok=True)
+            tmp = self.seen_file + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(dict(self._seen), f)
+            os.replace(tmp, self.seen_file)
+        except OSError:
+            pass        # memory still protects this session
+
+
 class KickWebhookListener:
     """Receives Kick `chat.message.sent` webhooks and pushes chat into a queue.
 
@@ -154,7 +294,7 @@ class KickWebhookListener:
 
     def __init__(self, channel_slug, message_queue=None, command_prefix="!ask",
                  on_ambient=None, port=None, public_url=None, health_s=30,
-                 url_file=None, ignored_users=()):
+                 url_file=None, ignored_users=(), seen_file=None):
         self.channel_slug = (channel_slug or "").strip().lower()
         self.message_queue = message_queue or queue.Queue()
         self.command_prefix = command_prefix
@@ -167,8 +307,10 @@ class KickWebhookListener:
         self._nag_every = max(1, 120 // self._health_s)   # re-nag ~every 2 min
         self._pubkey = None
         self._pubkey_at = 0.0
-        self._seen = OrderedDict()          # message id -> ts, for replay dedupe
-        self._seen_max = 2000
+        self._key_retry_at = 0.0
+        self._key_lock = threading.Lock()
+        # Replay protection (ReplayGuard): signed time + ids kept on disk.
+        self._guard = ReplayGuard(seen_file)
         self._runner = None
         self._loop = None
         self._verified = 0
@@ -179,41 +321,70 @@ class KickWebhookListener:
         self._tunnel_nag = 0
 
     # -- key handling --
-    def _key(self):
-        # Refresh hourly; a rotation must not require a restart.
-        if self._pubkey is None or (time.time() - self._pubkey_at) > 3600:
-            self._pubkey = fetch_public_key()
-            self._pubkey_at = time.time()
-        return self._pubkey
+    KEY_TTL_S = 3600        # refetch hourly: Kick can rotate the key
+    KEY_RETRY_S = 60        # after a failed fetch, wait this long to try again
 
-    def _verify(self, headers, raw: bytes) -> bool:
+    def _key(self, force=False):
+        """Kick's public key, refreshed hourly so a rotation doesn't need a
+        restart. If a refresh fails, the key already held keeps being used and
+        the fetch is retried after KEY_RETRY_S. (Before, one failed refresh
+        rejected every message until a fetch worked, and was retried - with a
+        20 s wait - on every single request.)"""
+        with self._key_lock:
+            now = time.time()
+            due = force or self._pubkey is None or now - self._pubkey_at > self.KEY_TTL_S
+            if due and now >= self._key_retry_at:
+                try:
+                    self._pubkey = fetch_public_key()
+                    self._pubkey_at = now
+                    self._key_retry_at = 0.0
+                except Exception as e:
+                    self._key_retry_at = now + self.KEY_RETRY_S
+                    note = (" - still using the key already held" if self._pubkey
+                            else " - Kick chat can't be checked until it works")
+                    print(f"[red]Kick webhook: cannot fetch public key "
+                          f"({type(e).__name__}){note}; trying again in {self.KEY_RETRY_S}s")
+            if self._pubkey is None:
+                raise RuntimeError("no Kick public key yet")
+            return self._pubkey
+
+    def _verify(self, headers, raw: bytes):
+        """Which signature checked out: "full" (Kick's documented scheme, which
+        covers the message id and timestamp too), "body" (body only), or None.
+        """
         msg_id = headers.get("Kick-Event-Message-Id", "")
         ts = headers.get("Kick-Event-Message-Timestamp", "")
         sig = headers.get("Kick-Event-Signature", "")
         if not (msg_id and ts and sig):
-            return False
+            return None
         try:
             key = self._key()
-        except Exception as e:
-            print(f"[red]Kick webhook: cannot fetch public key: {e}")
-            return False
-        # The documented scheme is "<id>.<timestamp>.<raw body>". Kick's own Go
-        # sample hashes the body alone, so accept that as a fallback: both still
-        # require a valid signature from Kick's key, so this weakens nothing.
+        except Exception:
+            return None             # _key has already said why
+        # The documented scheme is "<id>.<timestamp>.<raw body>".
         signed = f"{msg_id}.{ts}.".encode("utf-8") + raw
-        if verify_signature(key, signed, sig):
-            return True
-        return verify_signature(key, raw, sig)
 
-    def _dedupe(self, msg_id: str) -> bool:
-        if not msg_id:
-            return False
-        if msg_id in self._seen:
-            return True
-        self._seen[msg_id] = time.time()
-        while len(self._seen) > self._seen_max:
-            self._seen.popitem(last=False)
-        return False
+        def check(k):
+            if verify_signature(k, signed, sig):
+                return "full"
+            # Kick's own Go sample hashes the body alone, so that's accepted
+            # too; ReplayGuard then uses the id and time from inside the
+            # signed body.
+            if verify_signature(k, raw, sig):
+                return "body"
+            return None
+
+        mode = check(key)
+        if mode is None and time.time() - self._pubkey_at > 300:
+            # Maybe Kick rotated its key since the last fetch: fetch it again
+            # (at most once a minute) rather than reject chat for up to an hour.
+            try:
+                fresh = self._key(force=True)
+            except Exception:
+                fresh = key
+            if fresh != key:
+                mode = check(fresh)
+        return mode
 
     # -- health watchdog -------------------------------------------------
     # Kick only POSTs while a stream is live and someone is actually talking,
@@ -335,20 +506,27 @@ class KickWebhookListener:
         raw = await request.read()
         self._received += 1
 
-        if not self._verify(request.headers, raw):
+        # Checked on a worker thread: fetching the key (up to 20 s) and the RSA
+        # math must not stall this event loop, which serves every request.
+        mode = await asyncio.get_running_loop().run_in_executor(
+            None, self._verify, request.headers, raw)
+        if not mode:
             self._rejected += 1
             print("[yellow]Kick webhook: rejected an unverifiable request")
             return web.Response(status=401, text="invalid signature")
-
-        msg_id = request.headers.get("Kick-Event-Message-Id", "")
-        if self._dedupe(msg_id):
-            return web.Response(text="duplicate")   # 200 so Kick stops retrying
-        self._verified += 1
 
         try:
             payload = json.loads(raw.decode("utf-8"))
         except Exception:
             return web.Response(status=400, text="bad json")
+        if not isinstance(payload, dict):
+            return web.Response(status=400, text="bad json")
+
+        # A resent (replayed) message is answered 200 but not handled again.
+        verdict = self._guard.check(mode, request.headers, payload)
+        if verdict != "ok":
+            return web.Response(text=verdict)
+        self._verified += 1
 
         etype = request.headers.get("Kick-Event-Type", "")
         if etype == "chat.message.sent":
@@ -367,6 +545,7 @@ class KickWebhookListener:
             "received": self._received,
             "verified": self._verified,
             "rejected": self._rejected,
+            "stale": self._guard.stale,
             "tunnel_ok": self._tunnel_ok,
             "last_event_seconds_ago": (round(time.time() - last, 1)
                                        if last else None),
@@ -376,12 +555,22 @@ class KickWebhookListener:
                     "the real problem: Kick cannot reach the receiver.",
         }
 
+    # Headers a tunnel / proxy adds. A request carrying one came from the
+    # internet through the tunnel, not from this PC (both look like 127.0.0.1).
+    _VIA_TUNNEL_HEADERS = ("Cf-Ray", "Cf-Connecting-Ip", "X-Forwarded-For", "Forwarded")
+
     async def _status(self, request):
+        if any(h in request.headers for h in self._VIA_TUNNEL_HEADERS):
+            # From the internet: just "it's up" - enough for the health
+            # probe, without the details (tunnel URL, counters).
+            return web.json_response({"ok": True})
         return web.json_response(self.status())
 
     def start(self):
+        # The loop is set up for the listener's own thread only. Setting it
+        # here would replace the event loop of whatever program called
+        # start() (a host bot using asyncio, say).
         self._loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(self._loop)
 
         async def _run():
             app = web.Application()
@@ -401,6 +590,7 @@ class KickWebhookListener:
                 await asyncio.sleep(3600)
 
         def _thread():
+            asyncio.set_event_loop(self._loop)
             self._loop.run_until_complete(_run())
 
         self._runner = threading.Thread(target=_thread, daemon=True)

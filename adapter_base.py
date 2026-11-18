@@ -29,9 +29,10 @@ class AdapterBase:
 
 
 class FileAdapter(AdapterBase):
-    """Writes incoming Kick messages into messages.json inbox. An external
-    bot (any language) polls inbox, computes a reply, and writes it to
-    outbox. The bridge polls outbox and posts to Kick."""
+    """Writes incoming Kick messages into the mailbox inbox folder (one file
+    per message, see kick_mailbox.py). An external bot (any language) picks
+    them up, computes a reply, and drops it in the outbox folder. The bridge
+    polls the outbox and posts to Kick."""
 
     name = "file"
 

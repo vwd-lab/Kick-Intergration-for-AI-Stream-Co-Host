@@ -16,7 +16,12 @@ try:
     from dotenv import load_dotenv
     load_dotenv(dotenv_path=os.path.join(_HERE, ".env"))
 except ImportError:
-    pass  # .env optional; env vars read from the OS directly
+    # .env is optional (settings can come from the OS environment), but if
+    # there IS a .env, say it's being ignored - silently running with no
+    # channel, no keys etc. was hard to track down.
+    if os.path.exists(os.path.join(_HERE, ".env")):
+        print("[Kick kit] python-dotenv isn't installed, so the settings in .env are "
+              "being IGNORED. Fix: python -m pip install -r requirements.txt")
 
 
 def _path(value, default):
@@ -48,6 +53,15 @@ KICK_TOKENS_FILE = _path(
     os.path.join(_HERE, "kick_tokens.json"),
 )
 KICK_SEND_INTERVAL_S = float(os.getenv("KICK_SEND_INTERVAL_S", "2.0"))
+
+# --- Radeon AI Co-Host mailbox ---
+# On by default: demo_main.py drops each "!ask" chat message into the mailbox
+# folder the Co-Host reads, and posts the Co-Host's replies back to Kick chat
+# (when KICK_TEXT_REPLIES=1). Set KICK_MAILBOX=0 to use demo_main.py on its
+# own. The Co-Host looks in the same place by default (<this kit>/mailbox); if
+# you move it, set KICK_MAILBOX_DIR to the same folder in both .env files.
+KICK_MAILBOX = os.getenv("KICK_MAILBOX", "1") == "1"
+KICK_MAILBOX_DIR = _path(os.getenv("KICK_MAILBOX_DIR", ""), os.path.join(_HERE, "mailbox"))
 
 # --- Safety ---
 # The account the bot posts as. Used to sanity-check the OAuth result and,

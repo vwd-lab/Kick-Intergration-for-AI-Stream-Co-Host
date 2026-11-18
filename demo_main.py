@@ -12,16 +12,24 @@ This is a MINIMAL harness that wires the real receiver and sender
 
 Replace handle_message() with a call into YOUR bot's brain and you are done.
 
+Radeon AI Co-Host: with KICK_MAILBOX=1 (the default), every "!ask" message
+is dropped into the shared mailbox folder (see kick_mailbox.py) and the
+Co-Host's replies are posted back to Kick chat. Nothing else to wire up.
+
 Run:  python demo_main.py
 """
 import queue
 import sys
 import threading
 import time
+import uuid
 
 import config
 from input.kick_sender import KickSender
 from input.kick_webhook import KickWebhookListener
+from kick_mailbox import Mailbox
+
+mailbox = None      # set in __main__ when KICK_MAILBOX=1
 
 
 def make_sender():
@@ -64,6 +72,15 @@ def handle_message(user, formatted):
         return
     # ---------------------------------------------------------------------
 
+    # ---- Radeon AI Co-Host: hand "!ask" messages to it via the mailbox ----
+    if mailbox is not None:
+        if " asks]" in formatted:
+            mailbox.put_inbox(display, line, uuid.uuid4().hex)
+            print("[cyan]  -> sent to the Co-Host")
+        else:
+            print("[dim]  (not an ask - not sent to the Co-Host)")
+        return
+
     # ---- REPLACE FROM HERE WITH YOUR OWN LOGIC ----
     # The receiver forwards EVERY message, so decide here what deserves a
     # reply. The demo answers only messages sent with the !ask prefix.
@@ -100,6 +117,23 @@ def pump_inbox():
             print(f"[red]handle_message error: {type(e).__name__}: {e}")
 
 
+def post_cohost_replies_once():
+    """Post every reply the Co-Host has left in the mailbox outbox."""
+    for item in mailbox.take_outbox():
+        text = (item.get("reply") or "").strip()
+        if text:
+            reply(text)
+
+
+def pump_outbox(interval_s=1.0):
+    while True:
+        time.sleep(interval_s)
+        try:
+            post_cohost_replies_once()
+        except Exception as e:
+            print(f"[red]Co-Host reply error (will retry): {type(e).__name__}: {e}")
+
+
 if __name__ == "__main__":
     if not config.KICK_ENABLED:
         print("[yellow]KICK_ENABLED=0 in .env - not starting.")
@@ -126,6 +160,12 @@ if __name__ == "__main__":
         ignored_users=ignored,
     )
     sender = make_sender()
+
+    if config.KICK_MAILBOX:
+        mailbox = Mailbox(config.KICK_MAILBOX_DIR)
+        mailbox.ensure()
+        print(f"[cyan]Co-Host mailbox: {mailbox.folder}")
+        threading.Thread(target=pump_outbox, daemon=True).start()
 
     listener.start()
     threading.Thread(target=pump_inbox, daemon=True).start()

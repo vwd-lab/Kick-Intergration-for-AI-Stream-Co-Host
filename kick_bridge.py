@@ -5,8 +5,10 @@ Receives Kick chat messages via webhook, hands them to a bot adapter
 posts the bot's reply back into Kick chat.
 
 Three ways to connect a bot:
-  1. File adapter (default): writes inbox/messages.json, reads outbox.
-     Works with any language/framework that can read/write JSON.
+  1. File adapter (default): writes each chat message as its own file in the
+     mailbox folder (mailbox/inbox) and posts the replies your bot drops in
+     mailbox/outbox. See kick_mailbox.py for the format. Works with any
+     language/framework that can read/write JSON files.
   2. HTTP adapter: POSTs each message to a callback URL your bot exposes.
   3. Custom adapter: subclass AdapterBase and implement handle_message().
 
@@ -24,6 +26,7 @@ the signature check is required and cannot be switched off.
 
 import json
 import os
+import sys
 import threading
 import time
 from collections import OrderedDict
@@ -33,20 +36,51 @@ import requests
 
 try:
     # One copy of the crypto code: reuse the production listener's checker.
-    from input.kick_webhook import verify_signature, fetch_public_key
+    from input.kick_webhook import verify_signature, fetch_public_key, ReplayGuard
 except ImportError as _e:  # aiohttp / rich not installed
     raise SystemExit(
         f"kick_bridge.py could not load the signature checker ({_e}).\n"
         "Install the kit's requirements first:  python -m pip install -r requirements.txt"
     )
 
+from kick_mailbox import Mailbox
+
 ROOT = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(ROOT, "config.json")
-MESSAGES_PATH = os.path.join(ROOT, "messages.json")
 LOG_PATH = os.path.join(ROOT, "bridge.log")
+
+
+def _mailbox_dir(cfg):
+    """Mailbox folder: config.json "mailbox_dir", else KICK_MAILBOX_DIR from
+    the environment, else the "mailbox" folder in this kit (the Co-Host's
+    default too). Relative paths are taken from this kit's folder."""
+    folder = (cfg.get("mailbox_dir") or os.getenv("KICK_MAILBOX_DIR") or "").strip()
+    if not folder:
+        return os.path.join(ROOT, "mailbox")
+    return folder if os.path.isabs(folder) else os.path.join(ROOT, folder)
 
 # Kick chat webhooks are a few KB. Anything far bigger is not from Kick.
 MAX_BODY_BYTES = 64 * 1024
+
+
+def stop_cleanly_when_gui_asks():
+    """When a GUI (kick_gui.py / discord_gui.py) started this script, it keeps
+    our stdin open and closes it to ask us to stop. Turn that into Ctrl+C, so
+    the normal shutdown code below runs - the GUI used to kill the process
+    outright, which skipped it. Does nothing when run by hand."""
+    if os.environ.get("BRIDGE_GUI_CHILD") != "1" or sys.stdin is None:
+        return
+    import _thread
+
+    def watch():
+        try:
+            while sys.stdin.readline():
+                pass
+        except (OSError, ValueError):
+            pass
+        _thread.interrupt_main()
+
+    threading.Thread(target=watch, daemon=True).start()
 
 
 # ---------------------------------------------------------------------------
@@ -64,8 +98,9 @@ def load_config():
 
 
 def save_config(cfg):
-    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-        json.dump(cfg, f, indent=2)
+    # Holds the app's client secret: readable only by this Windows account.
+    from input.kick_sender import write_private_json
+    write_private_json(CONFIG_PATH, cfg)
 
 
 DEFAULT_CONFIG = {
@@ -79,6 +114,7 @@ DEFAULT_CONFIG = {
     "bind_host": "127.0.0.1",      # keep local; the tunnel connects from this PC
     "adapter": "file",             # file | http | custom
     "http_callback": "",           # http://localhost:5000/kick (if adapter=http)
+    "mailbox_dir": "",             # file adapter folder; empty = <this kit>/mailbox
     "text_replies": True,          # post bot replies back into Kick chat
     "command_prefix": "!ask",      # only respond to messages starting with this
     "reply_prefix": "Bot:",        # prepended to replies posted in Kick
@@ -92,57 +128,25 @@ DEFAULT_CONFIG = {
 # ---------------------------------------------------------------------------
 
 class MessageQueue:
-    """Thread-safe JSON mailbox. Any bot can drop a reply into outbox and
-    the bridge will post it to Kick."""
+    """The shared mailbox folder (see kick_mailbox.py): one file per message,
+    so the bridge and your bot can never overwrite each other's messages.
 
-    def __init__(self, path=MESSAGES_PATH):
-        self.path = path
-        self._lock = threading.Lock()
-        self._seed()
+    Kept under this name, with the same two methods, so existing adapters
+    (adapter_base.py) keep working. It used to be a single messages.json that
+    both programs read, changed and wrote back, which lost messages.
+    """
 
-    def _seed(self):
-        if not os.path.exists(self.path):
-            self.write({"inbox": [], "outbox": []})
-
-    def read(self):
-        with self._lock:
-            try:
-                with open(self.path, "r", encoding="utf-8") as f:
-                    return json.load(f)
-            except Exception:
-                return {"inbox": [], "outbox": []}
-
-    def write(self, data):
-        with self._lock:
-            tmp = self.path + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2)
-            os.replace(tmp, self.path)
+    def __init__(self, path=None):
+        self.mailbox = Mailbox(path or _mailbox_dir(load_config()))
+        self.mailbox.ensure()
+        self.path = self.mailbox.folder
 
     def push_inbox(self, username, message, msg_id):
-        data = self.read()
-        data["inbox"].append({
-            "id": msg_id,
-            "username": username,
-            "message": message,
-            "received_at": time.time(),
-        })
-        # keep inbox bounded
-        data["inbox"] = data["inbox"][-200:]
-        self.write(data)
+        self.mailbox.put_inbox(username, message, msg_id)
 
     def pop_outbox(self):
-        """Return and clear the outbox so the bot's reply is delivered once."""
-        with self._lock:
-            try:
-                with open(self.path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-            except Exception:
-                return []
-        outbox = data.get("outbox", [])
-        data["outbox"] = []
-        self.write(data)
-        return outbox
+        """Claim the waiting replies; each is delivered once."""
+        return self.mailbox.take_outbox()
 
 
 # ---------------------------------------------------------------------------
@@ -166,12 +170,12 @@ class AdapterBase:
 
 
 class FileAdapter(AdapterBase):
-    """Writes incoming messages to messages.json inbox. The external bot
-    reads inbox, computes a reply, and writes it to outbox. The bridge
-    polls outbox and posts to Kick."""
+    """Writes incoming messages to the mailbox inbox. The external bot reads
+    them, computes a reply, and drops it in the outbox. The bridge polls the
+    outbox and posts to Kick."""
 
-    def __init__(self, queue: MessageQueue):
-        self.queue = queue
+    def __init__(self, queue: MessageQueue = None):
+        self.queue = queue or MessageQueue()
 
     def handle_message(self, username, message, msg_id):
         self.queue.push_inbox(username, message, msg_id)
@@ -208,26 +212,8 @@ class HttpAdapter(AdapterBase):
         return None
 
 
-# ---------------------------------------------------------------------------
-# Kick API helpers
-# ---------------------------------------------------------------------------
-
-def kick_headers(access_token):
-    return {
-        "Authorization": f"Bearer {access_token}",
-        "Content-Type": "application/json",
-    }
-
-
-def post_kick_message(channel, access_token, text):
-    """Send a chat message into Kick as the bot account."""
-    url = f"https://api.kick.com/public/v1/channels/{channel}/chat/messages"
-    try:
-        r = requests.post(url, headers=kick_headers(access_token),
-                          json={"content": text}, timeout=10)
-        return r.status_code in (200, 201, 202), r.text
-    except Exception as e:
-        return False, str(e)
+# Replies to Kick are posted by _post_reply() below, through the same
+# KickSender production mode uses.
 
 
 # ---------------------------------------------------------------------------
@@ -268,45 +254,56 @@ class SignatureChecker:
                     _log(f"Cannot fetch Kick public key: {e}{note}")
             return self._key
 
-    def check(self, headers, raw: bytes) -> bool:
+    def check(self, headers, raw: bytes):
+        """"full" (Kick's documented scheme: id, timestamp and body signed),
+        "body" (body only, as Kick's sample code does) or None (not Kick)."""
         msg_id = headers.get("Kick-Event-Message-Id", "")
         ts = headers.get("Kick-Event-Message-Timestamp", "")
         sig = headers.get("Kick-Event-Signature", "")
         if not (msg_id and ts and sig):
-            return False
+            return None
         key = self._current_key()
         if not key:
-            return False
+            return None
         signed = f"{msg_id}.{ts}.".encode("utf-8") + raw
-        if self._verify(key, signed, sig):
-            return True
-        # Same body-only fallback as the production listener. Tightening it
-        # belongs to the replay-protection fix, not this one.
-        return self._verify(key, raw, sig)
 
+        def check(k):
+            if self._verify(k, signed, sig):
+                return "full"
+            # Body-only signatures are accepted too; REPLAY then takes the id
+            # and time from inside the signed body, not the unsigned headers.
+            if self._verify(k, raw, sig):
+                return "body"
+            return None
 
-class SeenIds:
-    """Remembers recent Kick message ids so a retried delivery is handled once."""
+        mode = check(key)
+        if mode is None:
+            # Maybe Kick rotated its key: fetch it again (at most every
+            # 5 minutes) rather than reject chat until the hourly refresh.
+            fresh = self._refetch_if_old(key)
+            if fresh and fresh != key:
+                mode = check(fresh)
+        return mode
 
-    def __init__(self, max_items=2000):
-        self._max = max_items
-        self._ids = OrderedDict()
-        self._lock = threading.Lock()
-
-    def seen_before(self, msg_id: str) -> bool:
-        if not msg_id:
-            return False
+    def _refetch_if_old(self, key):
         with self._lock:
-            if msg_id in self._ids:
-                return True
-            self._ids[msg_id] = time.time()
-            while len(self._ids) > self._max:
-                self._ids.popitem(last=False)
-            return False
+            now = time.time()
+            if self._key != key or now - self._key_at < 300 or now < self._next_try:
+                return self._key
+            try:
+                self._key = self._fetch()
+                self._key_at = now
+            except Exception as e:
+                self._next_try = now + self.RETRY_S
+                _log(f"Cannot fetch Kick public key: {e} (still using the cached key)")
+            return self._key
 
 
 CHECKER = SignatureChecker()
-SEEN = SeenIds()
+# Same replay protection as the production listener (input/kick_webhook.py):
+# signed time must be recent, and handled ids are remembered across restarts.
+REPLAY = ReplayGuard(seen_file=os.path.join(ROOT, "data", "kick_seen_ids_simple.json"),
+                     log=lambda msg: _log(msg))
 STATS = {"received": 0, "accepted": 0, "rejected": 0}
 _STATS_LOCK = threading.Lock()
 
@@ -350,16 +347,14 @@ class KickWebhookHandler(BaseHTTPRequestHandler):
             return self._reply(413, b"too large")
         raw = self.rfile.read(length)
 
-        if not CHECKER.check(self.headers, raw):
+        mode = CHECKER.check(self.headers, raw)
+        if not mode:
             n = _count("rejected")
             if n <= 3 or n % 50 == 0:   # don't let junk traffic flood the log
                 _log(f"Rejected a request without a valid Kick signature (total {n})")
             return self._reply(401, b"invalid signature")
 
         msg_id = self.headers.get("Kick-Event-Message-Id", "")
-        if SEEN.seen_before(msg_id):
-            return self._reply(200, b"duplicate")   # 200 so Kick stops retrying
-
         if self.headers.get("Kick-Event-Type", "") != "chat.message.sent":
             return self._reply(200, b"ignored")
 
@@ -369,6 +364,12 @@ class KickWebhookHandler(BaseHTTPRequestHandler):
             return self._reply(400, b"bad json")
         if not isinstance(payload, dict):
             return self._reply(400, b"bad json")
+
+        # A resent (replayed) message: answered 200 so Kick stops retrying,
+        # but not handled again.
+        verdict = REPLAY.check(mode, self.headers, payload)
+        if verdict != "ok":
+            return self._reply(200, verdict.encode())
 
         cfg = load_config()
         want = (cfg.get("kick_channel") or "").strip().lower()
@@ -397,11 +398,27 @@ class KickWebhookHandler(BaseHTTPRequestHandler):
 BRIDGE = None
 
 
+def _adapter_name(adapter):
+    """Adapters in this file have a name() method; the ones in adapter_base.py
+    have a plain `name` string. Calling the string crashed the bridge."""
+    name = getattr(adapter, "name", None)
+    if callable(name):
+        name = name()
+    return name or adapter.__class__.__name__
+
+
+def _uses_outbox(adapter):
+    """Any adapter with poll_outbox() gets its replies from the mailbox -
+    including the FileAdapter in adapter_base.py, which isn't a subclass of
+    the one in this file."""
+    return callable(getattr(adapter, "poll_outbox", None))
+
+
 class KickBridge:
     def __init__(self, config, adapter):
         self.config = config
         self.adapter = adapter
-        self.queue = adapter.queue if isinstance(adapter, FileAdapter) else None
+        self.queue = getattr(adapter, "queue", None) if _uses_outbox(adapter) else None
         self._server = None
         self._poller = None
 
@@ -418,26 +435,33 @@ class KickBridge:
                  "Signatures are still checked, but 127.0.0.1 is safer.")
         pub = cfg.get("public_url", "(not set)")
         _log(f"Public URL for Kick webhook: {pub}")
-        _log(f"Adapter: {self.adapter.name()}")
+        _log(f"Adapter: {_adapter_name(self.adapter)}")
 
-        if isinstance(self.adapter, FileAdapter):
+        if _uses_outbox(self.adapter):
+            if self.queue is not None:
+                _log(f"Mailbox: {getattr(self.queue, 'path', '?')}")
             self._poller = threading.Thread(target=self._poll_loop, daemon=True)
             self._poller.start()
 
-    def _poll_loop(self):
+    def _poll_loop(self, interval_s=2.0):
+        # Must never die: before, one error here stopped all replies until
+        # the bridge was restarted.
         while True:
-            time.sleep(2)
-            if not self.queue:
+            time.sleep(interval_s)
+            try:
+                self._post_outbox_once()
+            except Exception as e:
+                _log(f"Outbox error (will retry): {type(e).__name__}: {e}")
+
+    def _post_outbox_once(self):
+        for item in self.adapter.poll_outbox():
+            username = item.get("username", "viewer")
+            text = item.get("reply") or item.get("message") or ""
+            if not text:
                 continue
-            for item in self.adapter.poll_outbox():
-                username = item.get("username", "viewer")
-                text = item.get("reply") or item.get("message") or ""
-                msg_id = item.get("id")
-                if not text:
-                    continue
-                _log(f"Outbox -> {username}: {text[:80]}")
-                if self.config.get("text_replies"):
-                    _post_reply(text)
+            _log(f"Outbox -> {username}: {text[:80]}")
+            if self.config.get("text_replies"):
+                _post_reply(text)
 
     def dispatch(self, username, message, msg_id):
         # Command prefix gate
@@ -453,25 +477,51 @@ class KickBridge:
 
         reply = self.adapter.handle_message(username, clean, msg_id)
 
-        # If adapter returned None but uses file outbox, reply arrives via poll.
-        if reply is None and isinstance(self.adapter, FileAdapter):
+        # If adapter returned None but uses the mailbox, reply arrives via poll.
+        if reply is None and _uses_outbox(self.adapter):
             return None
 
         return reply
 
 
+_SENDER = None
+_SENDER_LOCK = threading.Lock()
+
+
+def _kick_sender(cfg):
+    """The same sender production mode uses (input/kick_sender.py): Kick's
+    documented chat API, with the login token refreshed automatically.
+
+    Simple mode used to post a fixed access token from config.json to an
+    address Kick doesn't document (.../channels/<slug>/chat/messages), and
+    never refreshed it - Kick tokens last about 2 hours."""
+    global _SENDER
+    with _SENDER_LOCK:
+        if _SENDER is None:
+            from input.kick_sender import KickSender
+            _SENDER = KickSender(client_id=cfg.get("kick_client_id", ""),
+                                 client_secret=cfg.get("kick_client_secret", ""),
+                                 target_slug=cfg.get("kick_channel", ""))
+            if not _SENDER.enabled:
+                _log("Text replies need a one-time login for the bot account: run "
+                     "setup_kick_auth.py (it writes kick_tokens.json). The access token "
+                     "field in config.json isn't used any more.")
+        return _SENDER
+
+
 def _post_reply(text):
     cfg = load_config()
-    token = cfg.get("kick_access_token", "")
-    channel = cfg.get("kick_channel", "")
-    if not token or not channel:
-        _log("Cannot post reply: missing kick_access_token or kick_channel")
+    if not cfg.get("kick_channel", ""):
+        _log("Cannot post reply: kick_channel is not set")
         return
     prefix = cfg.get("reply_prefix", "Bot:")
-    full = f"{prefix} {text}"[: cfg.get("max_reply_chars", 500)]
-    ok, resp = post_kick_message(channel, token, full)
-    if not ok:
-        _log(f"Kick post failed: {resp}")
+    full = f"{prefix} {text}".strip()[: cfg.get("max_reply_chars", 500)]
+    sender = _kick_sender(cfg)
+    if not sender.enabled:
+        _log("Kick reply not sent (text replies aren't set up - see above)")
+        return
+    if not sender.send(full):
+        _log("Kick post failed (see the messages above)")
 
 
 def _log(msg):
@@ -498,7 +548,17 @@ def run_forever(config, adapter):
             BRIDGE._server.shutdown()
 
 
+def make_adapter(cfg):
+    """The adapter chosen in the GUI / setup ("file" or "http")."""
+    if (cfg.get("adapter") or "file").strip().lower() == "http":
+        if not cfg.get("http_callback"):
+            _log("adapter is 'http' but http_callback is empty - using the file mailbox instead.")
+        else:
+            return HttpAdapter(cfg["http_callback"])
+    return FileAdapter(MessageQueue(_mailbox_dir(cfg)))
+
+
 if __name__ == "__main__":
+    stop_cleanly_when_gui_asks()
     cfg = {**DEFAULT_CONFIG, **load_config()}
-    adapter = FileAdapter(MessageQueue())
-    run_forever(cfg, adapter)
+    run_forever(cfg, make_adapter(cfg))
